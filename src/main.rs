@@ -68,7 +68,7 @@ fn main() {
                 let mut stmt = conn.prepare("SELECT ip, COUNT(*) AS count FROM hits WHERE timestamp>datetime('now', '-10 minute') GROUP BY ip ORDER BY count DESC LIMIT 10").expect("fail on rate prep");
                 let mut rows = stmt.query(NO_PARAMS).expect("failed on rate query");
 
-                response.push_str("\\nHits in last 10 min\\n===================\\n");
+                response.push_str("\\nTop 10 in last 10 min\\n=====================\\n");
 
                 while let Some(row) = rows.next() {
                     let row = row.unwrap();
