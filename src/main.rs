@@ -1,4 +1,5 @@
-#[macro_use] extern crate serde_derive;
+#[macro_use]
+extern crate serde_derive;
 extern crate serde;
 extern crate serde_json;
 
@@ -12,11 +13,12 @@ use rusqlite::{Connection, NO_PARAMS};
 use std::process::Command;
 
 extern crate iron;
-use std::sync::{Arc,Mutex};
 use iron::prelude::*;
 use iron::status;
+use std::sync::{Arc, Mutex};
 
-#[macro_use] extern crate hyper;
+#[macro_use]
+extern crate hyper;
 
 header! { (XRealIP, "X-Real-IP") => [String] }
 
@@ -39,8 +41,9 @@ fn main() {
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             ip TEXT NOT NULL
             )",
-            NO_PARAMS
-    ).expect("failed on create table");;
+        NO_PARAMS,
+    )
+    .expect("failed on create table");;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS geolookups (
             ip TEXT NOT NULL,
@@ -52,14 +55,14 @@ fn main() {
             postal TEXT NOT NULL,
             org TEXT NOT NULL
             )",
-            NO_PARAMS
-    ).expect("failed on create geolookups table");
+        NO_PARAMS,
+    )
+    .expect("failed on create geolookups table");
 
     let conns = Arc::new(Mutex::new(conn));
 
     Iron::new(move |req: &mut Request| {
-        if let Some(ip_addr_s) = req.headers.get::<XRealIP>() {
-            if let Ok(conn) = conns.lock() {
+        if let (Some(ip_addr_s), Ok(conn)) = (req.headers.get::<XRealIP>(), conns.lock()) {
                 let ip_addr_v = (&ip_addr_s).split(',').collect::<Vec<&str>>();
                 let ip_addr = ip_addr_v[ip_addr_v.len()-1].trim().to_string();
 
@@ -80,7 +83,7 @@ fn main() {
                                 {
                                     let mut transfer = easy.transfer();
                                     transfer.write_function(|new_data| {
-                                        println!("{}",String::from_utf8(new_data.to_vec()).expect("fail on string from utf8"));
+                                        println!("{}",String::from_utf8(new_data.to_vec()).unwrap_or("failed to print".to_string()));
                                         data.extend_from_slice(new_data);
                                         Ok(new_data.len())
                                     }).expect("fail on easy write fn");
@@ -105,12 +108,10 @@ fn main() {
                 response.push_str("Last 5\\n======\\n");
                 if let Ok(mut stmt) = conn.prepare("SELECT ip FROM hits GROUP BY ip HAVING timestamp=MAX(timestamp) ORDER BY timestamp DESC LIMIT 5") {
                     if let Ok(mut rows) = stmt.query(NO_PARAMS) {
-                        while let Some(row) = rows.next() {
-                            if let Ok(row) = row {
-                                let ip: String = row.get(0);
-                                response.push_str(ip.as_str());
-                                response.push('\n');
-                            }
+                        while let Some(Ok(row)) = rows.next() {
+                            let ip: String = row.get(0);
+                            response.push_str(ip.as_str());
+                            response.push('\n');
                         }
                     }
                 }
@@ -119,15 +120,13 @@ fn main() {
                 response.push_str("\\nTop 10\n======\\n");
                 if let Ok(mut stmt) = conn.prepare("SELECT ip, COUNT(*) AS count FROM hits GROUP BY ip ORDER BY count DESC LIMIT 10") {
                     if let Ok(mut rows) = stmt.query(NO_PARAMS) {
-                        while let Some(row) = rows.next() {
-                            if let Ok(row) = row {
-                                let ip: String = row.get(0);
-                                let count: i64 = row.get(1);
-                                response.push_str(ip.as_str());
-                                response.push_str(": ");
-                                response.push_str(count.to_string().as_str());
-                                response.push('\n');
-                            }
+                        while let Some(Ok(row)) = rows.next() {
+                            let ip: String = row.get(0);
+                            let count: i64 = row.get(1);
+                            response.push_str(ip.as_str());
+                            response.push_str(": ");
+                            response.push_str(count.to_string().as_str());
+                            response.push('\n');
                         }
                     }
                 }
@@ -136,15 +135,13 @@ fn main() {
                 response.push_str("\\nTop 10 in last 10 min\\n=====================\\n");
                 if let Ok(mut stmt) = conn.prepare("SELECT ip, COUNT(*) AS count FROM hits WHERE timestamp>datetime('now', '-10 minute') GROUP BY ip ORDER BY count DESC LIMIT 10") {
                     if let Ok(mut rows) = stmt.query(NO_PARAMS) {
-                        while let Some(row) = rows.next() {
-                            if let Ok(row) = row {
-                                let ip: String = row.get(0);
-                                let count: i64 = row.get(1);
-                                response.push_str(ip.as_str());
-                                response.push_str(": ");
-                                response.push_str(count.to_string().as_str());
-                                response.push('\n');
-                            }
+                        while let Some(Ok(row)) = rows.next() {
+                            let ip: String = row.get(0);
+                            let count: i64 = row.get(1);
+                            response.push_str(ip.as_str());
+                            response.push_str(": ");
+                            response.push_str(count.to_string().as_str());
+                            response.push('\n');
                         }
                     }
                 }
@@ -157,7 +154,6 @@ fn main() {
 
                 return Ok(Response::with((status::Ok, response)));
             }
-        }
         Ok(Response::with((status::Ok, "something weird about how you're accessing this site\n"))) 
     }).http("localhost:3001").unwrap();
 }
