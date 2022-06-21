@@ -1,162 +1,146 @@
-#[macro_use]
-extern crate serde_derive;
-extern crate serde;
-extern crate serde_json;
-
-extern crate curl;
-use curl::easy::Easy;
-
-extern crate rusqlite;
-use rusqlite::types::ToSql;
-use rusqlite::{Connection, NO_PARAMS};
-
-use std::process::Command;
-
-extern crate iron;
-use iron::prelude::*;
-use iron::status;
+use warp::Filter;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use rand::Rng;
+use std::time::SystemTime;
 
-#[macro_use]
-extern crate hyper;
+const LAST_N: usize = 5;
+const TOP_N:  usize = 10;
+const TOP_N_LAST_MINUTES: usize = 10;
+const LAST_N_MINUTES: u64 = 10;
+const SYNC_TIME_MINUTES: u64 = 10; 
 
-header! { (XRealIP, "X-Real-IP") => [String] }
-
-#[derive(Deserialize)]
-struct Geolookup {
-    ip: String,
-    hostname: String,
-    city: String,
-    region: String,
-    country: String,
-    loc: String,
-    postal: String,
-    org: String,
+#[derive(Clone)]
+struct Database {
+    map: Arc<Mutex<HashMap<String, (u64, Vec<SystemTime>)>>>,
+    last_five: Arc<Mutex<VecDeque<String>>>,
 }
 
-fn main() {
-    let conn = Connection::open("db.sqlite3").unwrap();
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS hits (
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            ip TEXT NOT NULL
-            )",
-        NO_PARAMS,
-    )
-    .expect("failed on create table");;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS geolookups (
-            ip TEXT NOT NULL,
-            hostname TEXT NOT NULL,
-            city TEXT NOT NULL,
-            region TEXT NOT NULL,
-            country TEXT NOT NULL,
-            loc TEXT NOT NULL,
-            postal TEXT NOT NULL,
-            org TEXT NOT NULL
-            )",
-        NO_PARAMS,
-    )
-    .expect("failed on create geolookups table");
-
-    let conns = Arc::new(Mutex::new(conn));
-
-    Iron::new(move |req: &mut Request| {
-        if let (Some(ip_addr_s), Ok(conn)) = (req.headers.get::<XRealIP>(), conns.lock()) {
-            let ip_addr_v = (&ip_addr_s).split(',').collect::<Vec<&str>>();
-            let ip_addr = ip_addr_v[ip_addr_v.len()-1].trim().to_string();
-
-            conn.execute(
-                "INSERT INTO hits (ip)
-                            VALUES (?1)",
-                            &[&ip_addr as &ToSql],
-                            ).unwrap_or(0);
-
-            /* Check if ip already seen and otherwise geolookup and add to table */
-            if let Ok(mut stmt) = conn.prepare("SELECT 1 FROM geolookups WHERE ip=?1 LIMIT 1") {
-                if let Ok(exists) = stmt.exists(&[&ip_addr as &ToSql]) {
-                    if !exists {
-                        /* geolookup ip */
-                        let mut easy = Easy::new();
-                        let mut data = Vec::new();
-                        if easy.url(&("http://ipinfo.io/".to_owned() + &ip_addr)).is_ok() {
-                            let mut b = false;
-                            {
-                                let mut transfer = easy.transfer();
-                                if transfer.write_function(|new_data| {
-                                    println!("{}",String::from_utf8(new_data.to_vec()).unwrap_or("failed to print".to_string()));
-                                    data.extend_from_slice(new_data);
-                                    Ok(new_data.len())
-                                }).is_ok() {
-                                    b = transfer.perform().is_ok();
-                                }
-                            }
-                            if b {
-                                if let Ok(v) = serde_json::from_slice(&data) as serde_json::Result<Geolookup> {
-                                    conn.execute(
-                                        "INSERT INTO geolookups (ip, hostname, city, region, country, loc, postal, org)
-                                                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                                                &[&v.ip as &ToSql, &v.hostname as &ToSql, &v.city as &ToSql, &v.region as &ToSql, &v.country as &ToSql, &v.loc as &ToSql, &v.postal as &ToSql, &v.org as &ToSql],
-                                                ).unwrap_or(0);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            /* Create response */
-            let mut response: String = String::new();
-
-            /* Add Last 5 */
-            response.push_str("Last 5\\n======\\n");
-            if let Ok(mut stmt) = conn.prepare("SELECT ip FROM hits GROUP BY ip HAVING timestamp=MAX(timestamp) ORDER BY timestamp DESC LIMIT 5") {
-                if let Ok(mut rows) = stmt.query(NO_PARAMS) {
-                    while let Some(Ok(row)) = rows.next() {
-                        let ip: String = row.get(0);
-                        response.push_str(ip.as_str());
-                        response.push('\n');
-                    }
-                }
-            }
-
-            /* Add Top 10*/
-            response.push_str("\\nTop 10\n======\\n");
-            if let Ok(mut stmt) = conn.prepare("SELECT ip, COUNT(*) AS count FROM hits GROUP BY ip ORDER BY count DESC LIMIT 10") {
-                if let Ok(mut rows) = stmt.query(NO_PARAMS) {
-                    while let Some(Ok(row)) = rows.next() {
-                        let ip: String = row.get(0);
-                        let count: i64 = row.get(1);
-                        response.push_str(ip.as_str());
-                        response.push_str(": ");
-                        response.push_str(count.to_string().as_str());
-                        response.push('\n');
-                    }
-                }
-            }
-
-            /* Add Top 10 in last 10 min */
-            response.push_str("\\nTop 10 in last 10 min\\n=====================\\n");
-            if let Ok(mut stmt) = conn.prepare("SELECT ip, COUNT(*) AS count FROM hits WHERE timestamp>datetime('now', '-10 minute') GROUP BY ip ORDER BY count DESC LIMIT 10") {
-                if let Ok(mut rows) = stmt.query(NO_PARAMS) {
-                    while let Some(Ok(row)) = rows.next() {
-                        let ip: String = row.get(0);
-                        let count: i64 = row.get(1);
-                        response.push_str(ip.as_str());
-                        response.push_str(": ");
-                        response.push_str(count.to_string().as_str());
-                        response.push('\n');
-                    }
-                }
-            }
-
-            response = match Command::new("./cowsayer.sh").args(vec![response.clone()]).output() {
-                Ok(x) => String::from_utf8(x.stdout).unwrap_or(response),
-                _ => response
-            };
-
-            return Ok(Response::with((status::Ok, response)));
+impl Database {
+    fn new() -> Database {
+        Database {
+            map: Arc::new(Mutex::new(HashMap::new())),
+            last_five: Arc::new(Mutex::new(VecDeque::with_capacity(LAST_N))),
         }
-        Ok(Response::with((status::Ok, "something weird about how you're accessing this site\n"))) 
-    }).http("localhost:3001").unwrap();
+    }
+
+    fn increment(&self, ip: String) -> Vec<(String, u64, SystemTime)> {
+        let mut map = self.map.lock().unwrap();
+
+        let entry = map.entry(ip).or_insert((0, vec![]));
+        (*entry).0 += 1;
+        (*entry).1.push(SystemTime::now());
+
+        map.clone().into_iter().map(|(ip, (count, times))| (ip, count, times[times.len()-1])).collect()
+    }
+
+    fn update_last_five(&self, ip: String) -> Vec<String> {
+        let mut last_five = self.last_five.lock().unwrap();
+
+        if last_five.contains(&ip) {
+            last_five.retain(|e| ip != *e);
+        }
+        if last_five.len() >= LAST_N {
+            last_five.pop_back();
+        }
+        last_five.push_front(ip);
+
+        last_five.clone().into_iter().collect()
+    }
+
+    fn new_hit(&self, ip: String) -> (Vec<(String, u64, SystemTime)>, Vec<String>) {
+        let counts_vec = self.increment(ip.clone());
+        let last_five_vec = self.update_last_five(ip);
+        (counts_vec, last_five_vec)
+    }
+
+    fn write_to_file(&self) {
+        let mut map = self.map.lock().unwrap();
+        let _last_five = self.last_five.lock().unwrap();
+
+        // Write to disk.
+        
+        // Retain only relevant data in memory.
+        let curr_time = SystemTime::now();
+        for (count, timestamps) in map.values_mut() {
+            timestamps.retain(|timestamp| 
+                match curr_time.duration_since(*timestamp) {
+                    Ok(duration) => duration.as_secs() < 60*LAST_N_MINUTES,
+                    Err(_) => false, // If 'earlier' timestamp is after current time, remove it to
+                                     // prevent effective memory leak.
+                }
+            );
+            *count = timestamps.len() as u64;
+        }
+        map.retain(|_, (count, _)| *count != 0); // Keep ips which have hit the website in
+                                                 // the last N minutes.
+    }
+}
+
+fn handle_request(addr: Option<std::net::SocketAddr>, db: Database) -> String {
+    let ip = if let Some(addr) = addr {
+        addr.ip().to_string()
+    } else {
+        "0.0.0.0".to_string()
+    };
+
+    let (mut counts, last_five) = db.new_hit(ip);
+
+    counts.sort_unstable_by_key(|k| k.1);
+
+    let top_10: Vec<String> = counts.iter().rev().take(TOP_N)
+        .map(|(ip, count, _)| ip.to_owned() + ": " +  &count.to_string()).collect();
+
+    let curr_time = SystemTime::now();
+    let last_10min_top_10: Vec<String> = counts.iter().rev()
+        .filter(|(_, _, timestamp)| true ||
+            match curr_time.duration_since(*timestamp) {
+                Ok(duration) => duration.as_secs() < 60*LAST_N_MINUTES,
+                Err(_) => true, // If 'earlier' timestamp is after current time, accept it.
+            }
+        )
+        .take(TOP_N_LAST_MINUTES)
+        .map(|(ip, count, _)| ip.to_owned() + ": " +  &count.to_string()).collect();
+    
+    let display = vec![
+        "Last 5".to_owned(),
+        "------".to_owned(),
+        last_five.join("\n"),
+        "".to_owned(),
+        "Top 10".to_owned(),
+        "------".to_owned(),
+        top_10.join("\n"),
+        "".to_owned(),
+        "Top 10 in last 10 min".to_owned(),
+        "---------------------".to_owned(),
+        last_10min_top_10.join("\n")
+    ];
+    display.join("\n")
+}
+
+#[tokio::main]
+async fn main() {
+    let db = Database::new();
+
+    // Increase size of database for testing
+    let num_fake_ips = 1000;
+    let distr = rand::distributions::Uniform::<u32>::new(0, 50);
+    let mut rng = rand::thread_rng();
+    for n in 1..num_fake_ips {
+        for _ in 1..rng.sample(distr) {
+            db.new_hit(n.to_string());
+        }
+    }
+    println!("Done generating fake database");
+
+    let sync_db = db.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(SYNC_TIME_MINUTES * 60)).await;
+            sync_db.write_to_file();
+        }
+    });
+
+    let routes = warp::addr::remote().map(move |addr| handle_request(addr, db.clone()));
+    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
