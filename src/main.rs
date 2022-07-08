@@ -1,88 +1,19 @@
 use rand::Rng;
 use sqlx::sqlite::SqlitePool;
 use sqlx::types::chrono::{DateTime, Utc};
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use warp::Filter;
+
+mod database;
+use database::Database;
 
 const LAST_N: usize = 5;
 const TOP_N: usize = 10;
 const TOP_N_LAST_MINUTES: usize = 10;
-const LAST_N_MINUTES: u64 = 1;
+const LAST_N_MINUTES: u64 = 10;
 const SYNC_TIME_MINUTES: u64 = 1;
-
-#[derive(Clone)]
-struct Database {
-    map: Arc<Mutex<HashMap<String, (u64, Vec<SystemTime>)>>>,
-    last_five: Arc<Mutex<VecDeque<String>>>,
-}
-
-impl Database {
-    fn new() -> Database {
-        Database {
-            map: Arc::new(Mutex::new(HashMap::new())),
-            last_five: Arc::new(Mutex::new(VecDeque::with_capacity(LAST_N))),
-        }
-    }
-
-    fn increment(&self, ip: String) -> HashMap<String, (u64, Vec<SystemTime>)> {
-        let mut map = self.map.lock().unwrap();
-
-        let entry = map.entry(ip).or_insert((0, vec![]));
-        entry.0 += 1;
-        entry.1.push(SystemTime::now());
-
-        map.clone()
-    }
-
-    fn update_last_five(&self, ip: String) -> Vec<String> {
-        let mut last_five = self.last_five.lock().unwrap();
-
-        if last_five.contains(&ip) {
-            last_five.retain(|e| ip != *e);
-        }
-        if last_five.len() >= LAST_N {
-            last_five.pop_back();
-        }
-        last_five.push_front(ip);
-
-        last_five.clone().into_iter().collect()
-    }
-
-    fn new_hit(&self, ip: String) -> (HashMap<String, (u64, Vec<SystemTime>)>, Vec<String>) {
-        let counts_vec = self.increment(ip.clone());
-        let last_five_vec = self.update_last_five(ip);
-        (counts_vec, last_five_vec)
-    }
-
-    fn purge_db(&self) -> (SystemTime, HashMap<String, (u64, Vec<SystemTime>)>) {
-        let mut map = self.map.lock().unwrap();
-        let _last_five = self.last_five.lock().unwrap();
-
-        let db_snapshot = map.clone();
-
-        // Retain only relevant data in memory.
-        let curr_time = SystemTime::now();
-        for (_, timestamps) in map.values_mut() {
-            timestamps.retain(|timestamp| match curr_time.duration_since(*timestamp) {
-                Ok(duration) => duration.as_secs() < 60 * LAST_N_MINUTES,
-                Err(_) => false, // If 'earlier' timestamp is after current time, remove it to
-                                 // prevent effective memory leak.
-            });
-        }
-        // Keep ips which have hit the website in the last N minutes or are in the top 10 all time.
-        let mut counts = map
-            .values()
-            .map(|(count, _)| *count)
-            .collect::<Vec<u64>>();
-        counts.sort_unstable();
-        let top_10_thresh = counts.iter().rev().nth(TOP_N - 1).unwrap_or(&0);
-        map.retain(|_, (count, timestamps)| timestamps.len() > 0 || (*count >= *top_10_thresh));
-
-        (curr_time, db_snapshot)
-    }
-}
+const DATABASE_PATH: &'static str = "sqlite:db.sqlite3";
+const SERVER_PORT: u16 = 3002;
 
 fn count_recent_hits(timestamps: &Vec<SystemTime>, curr_time: &SystemTime) -> u64 {
     timestamps
@@ -96,13 +27,7 @@ fn count_recent_hits(timestamps: &Vec<SystemTime>, curr_time: &SystemTime) -> u6
         .count() as u64
 }
 
-fn handle_request(addr: Option<std::net::SocketAddr>, db: Database) -> String {
-    let ip = if let Some(addr) = addr {
-        addr.ip().to_string()
-    } else {
-        "0.0.0.0".to_string()
-    };
-
+fn handle_request(ip: String, db: Database) -> String {
     let (map, last_five) = db.new_hit(ip);
 
     let curr_time = SystemTime::now();
@@ -144,11 +69,7 @@ fn handle_request(addr: Option<std::net::SocketAddr>, db: Database) -> String {
     display.join("\n")
 }
 
-async fn sync_database(db: Database) {
-    let pool = SqlitePool::connect("sqlite:db.sqlite3")
-        .await
-        .expect("Failed to start pool");
-
+async fn sync_database(db: Database, pool: &SqlitePool) {
     let mut last_sync_time = None;
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(SYNC_TIME_MINUTES * 60)).await;
@@ -198,9 +119,27 @@ async fn sync_database(db: Database) {
     }
 }
 
+async fn load_database(db: &Database, pool: &SqlitePool) {
+    let hits_top_n = sqlx::query!(r#"SELECT ip, COUNT(ip) as "count: u32" FROM hits GROUP BY ip ORDER BY COUNT(ip) DESC LIMIT ?"#, TOP_N as u32)
+        .fetch_all(pool)
+        .await
+        .expect("Failed to read top 10 from database.");
+
+    let last_n_minutes = format!("-{LAST_N_MINUTES}");
+    let hits_last_n_minutes = sqlx::query!(r#"SELECT ip, timestamp FROM hits WHERE timestamp >= DATETIME('NOW', ?) ORDER BY timestamp ASC"#, last_n_minutes)
+        .fetch(pool)
+        .await
+        .expect("Failed to read hits in last n minutes.");
+}
+
 #[tokio::main]
 async fn main() {
-    let db = Database::new();
+    let pool = SqlitePool::connect(DATABASE_PATH)
+        .await
+        .expect("Failed to start pool");
+
+    let db = Database::new(LAST_N, TOP_N, LAST_N_MINUTES);
+    load_database(&db, &pool).await;
 
     // Increase size of database for testing
     let num_fake_ips = 1000;
@@ -216,9 +155,9 @@ async fn main() {
 
     let sync_db = db.clone();
     tokio::spawn(async move {
-        sync_database(sync_db).await;
+        sync_database(sync_db, &pool).await;
     });
 
-    let routes = warp::addr::remote().map(move |addr| handle_request(addr, db.clone()));
-    warp::serve(routes).run(([127, 0, 0, 1], 3002)).await;
+    let routes = warp::header("X-Real-IP").map(move |ip| handle_request(ip, db.clone()));
+    warp::serve(routes).run(([127, 0, 0, 1], SERVER_PORT)).await;
 }
