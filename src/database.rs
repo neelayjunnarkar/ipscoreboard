@@ -32,7 +32,7 @@ impl Database {
         map.clone()
     }
 
-    fn update_last_five(&self, ip: String) -> Vec<String> {
+    pub fn update_last_five(&self, ip: String) -> Vec<String> {
         let mut last_five = self.last_five.lock().unwrap();
 
         if last_five.contains(&ip) {
@@ -74,5 +74,25 @@ impl Database {
         map.retain(|_, (count, timestamps)| timestamps.len() > 0 || (*count >= *top_10_thresh));
 
         (curr_time, db_snapshot)
+    }
+
+    pub fn insert_timestamp(&self, ip: String, timestamp: SystemTime) {
+        let mut map = self.map.lock().unwrap();
+        let entry = map.entry(ip).or_insert((0, vec![]));
+        entry.1.push(timestamp);
+    }
+
+    pub fn get_all_time_hits(&self, ip: &String) -> u64 {
+        let map = self.map.lock().unwrap();
+        match map.get(ip) {
+            Some((count, _)) => *count,
+            _ => 0,
+        }
+    }
+
+    pub fn set_all_time_hits(&self, ip: String, count: u64) {
+        let mut map = self.map.lock().unwrap();
+        let entry = map.entry(ip).or_insert((0, vec![]));
+        entry.0 = count;
     }
 }

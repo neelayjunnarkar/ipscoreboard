@@ -1,6 +1,7 @@
-use rand::Rng;
+use futures::TryStreamExt;
+//use rand::Rng;
 use sqlx::sqlite::SqlitePool;
-use sqlx::types::chrono::{DateTime, Utc};
+use sqlx::types::chrono::{DateTime, Local, TimeZone, Utc};
 use std::time::SystemTime;
 use warp::Filter;
 
@@ -120,16 +121,55 @@ async fn sync_database(db: Database, pool: &SqlitePool) {
 }
 
 async fn load_database(db: &Database, pool: &SqlitePool) {
-    let hits_top_n = sqlx::query!(r#"SELECT ip, COUNT(ip) as "count: u32" FROM hits GROUP BY ip ORDER BY COUNT(ip) DESC LIMIT ?"#, TOP_N as u32)
+    // Read top N from database.
+    let hits_top_n = sqlx::query!(r#"SELECT ip, COUNT(ip) AS "count: u32" FROM hits GROUP BY ip ORDER BY COUNT(ip) DESC LIMIT ?"#, TOP_N as u32)
         .fetch_all(pool)
         .await
-        .expect("Failed to read top 10 from database.");
+        .expect("Failed to read top N from database.");
+    for record in hits_top_n.into_iter() {
+        if let (Some(ip), Some(count)) = (record.ip, record.count) {
+            db.set_all_time_hits(ip, count.into());
+        } else {
+            println!("Failed to read a top ip count");
+        }
+    }
 
-    let last_n_minutes = format!("-{LAST_N_MINUTES}");
-    let hits_last_n_minutes = sqlx::query!(r#"SELECT ip, timestamp FROM hits WHERE timestamp >= DATETIME('NOW', ?) ORDER BY timestamp ASC"#, last_n_minutes)
-        .fetch(pool)
-        .await
-        .expect("Failed to read hits in last n minutes.");
+    // Read hits from last N minutes.
+    let last_n_minutes = format!("-{LAST_N_MINUTES} minute");
+    let mut hits_last_n_minutes = sqlx::query!(r#"SELECT ip, timestamp FROM hits WHERE timestamp >= DATETIME('NOW', ?) ORDER BY timestamp ASC"#, last_n_minutes)
+        .fetch(pool);
+    while let Some(hit) = hits_last_n_minutes.try_next().await.expect("Failed to read next row") {
+        let ip = hit.ip;
+        let timestamp = SystemTime::from(Local.from_local_datetime(&hit.timestamp.unwrap()).unwrap());
+        db.insert_timestamp(ip.clone(), timestamp);
+        if db.get_all_time_hits(&ip) == 0 {
+            let ip_all_time_hits = sqlx::query!(
+                r#"SELECT COUNT(ip) AS "count: u32" FROM hits WHERE ip == ?"#,
+                ip
+            )
+            .fetch_one(pool)
+            .await
+            .expect("Failed to read total number of hits for ip")
+            .count;
+            db.set_all_time_hits(ip, ip_all_time_hits.into());
+        }
+    }
+
+    // Read last N hits.
+    let last_n_hits = sqlx::query!(
+        r#"SELECT ip FROM hits ORDER BY timestamp DESC LIMIT ?"#,
+        LAST_N as u32
+    )
+    .fetch_all(pool)
+    .await
+    .expect("Failed to read last N from database.");
+    for record in last_n_hits.into_iter().rev() {
+        if let Some(ip) = record.ip {
+            db.update_last_five(ip);
+        } else {
+            println!("Failed to read one of the last N ips.");
+        }
+    }
 }
 
 #[tokio::main]
@@ -140,18 +180,19 @@ async fn main() {
 
     let db = Database::new(LAST_N, TOP_N, LAST_N_MINUTES);
     load_database(&db, &pool).await;
+    println!("Done loading database");
 
     // Increase size of database for testing
-    let num_fake_ips = 1000;
-    let distr = rand::distributions::Uniform::<u32>::new(0, 50);
-    let mut rng = rand::thread_rng();
-    for n in 1..num_fake_ips {
-        let num_hits = rng.sample(distr);
-        for _ in 0..(num_hits + 1) {
-            db.new_hit(n.to_string());
-        }
-    }
-    println!("Done generating fake database");
+    //let num_fake_ips = 1000;
+    //let distr = rand::distributions::Uniform::<u32>::new(0, 50);
+    //let mut rng = rand::thread_rng();
+    //for n in 1..num_fake_ips {
+    //let num_hits = rng.sample(distr);
+    //for _ in 0..(num_hits + 1) {
+    //db.new_hit(n.to_string());
+    //}
+    //}
+    //println!("Done generating fake database");
 
     let sync_db = db.clone();
     tokio::spawn(async move {
