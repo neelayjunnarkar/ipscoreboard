@@ -1,5 +1,4 @@
 use futures::TryStreamExt;
-//use rand::Rng;
 use sqlx::sqlite::SqlitePool;
 use sqlx::types::chrono::{DateTime, Local, TimeZone, Utc};
 use std::time::SystemTime;
@@ -7,6 +6,9 @@ use warp::Filter;
 
 mod database;
 use database::Database;
+
+mod cowsay;
+use cowsay::Cowsay;
 
 const LAST_N: usize = 5;
 const TOP_N: usize = 10;
@@ -28,8 +30,8 @@ fn count_recent_hits(timestamps: &Vec<SystemTime>, curr_time: &SystemTime) -> u6
         .count() as u64
 }
 
-fn handle_request(ip: String, db: Database) -> String {
-    let (map, last_five) = db.new_hit(ip);
+fn handle_request(ip: String, db: Database, cowsay: &Cowsay) -> String {
+    let (map, mut last_five) = db.new_hit(ip);
 
     let curr_time = SystemTime::now();
     let mut counts: Vec<(String, u64, u64)> = map
@@ -38,7 +40,7 @@ fn handle_request(ip: String, db: Database) -> String {
         .collect();
 
     counts.sort_unstable_by_key(|k| k.1); // Sort by all time counts.
-    let top_10: Vec<String> = counts
+    let mut top_10: Vec<String> = counts
         .iter()
         .rev()
         .take(TOP_N)
@@ -46,7 +48,7 @@ fn handle_request(ip: String, db: Database) -> String {
         .collect();
 
     counts.sort_unstable_by_key(|k| k.2); // Sort by recent counts.
-    let last_10min_top_10: Vec<String> = counts
+    let mut last_10min_top_10: Vec<String> = counts
         .iter()
         .rev()
         .filter(|(_, _, recent_count)| *recent_count > 0)
@@ -54,24 +56,25 @@ fn handle_request(ip: String, db: Database) -> String {
         .map(|(ip, _, recent_counts)| ip.to_owned() + ": " + &recent_counts.to_string())
         .collect();
 
-    let display = vec![
-        format!("Last {}", LAST_N),
-        "------".to_owned(),
-        last_five.join("\n"),
-        "".to_owned(),
-        format!("Top {}", TOP_N),
-        "------".to_owned(),
-        top_10.join("\n"),
-        "".to_owned(),
-        format!("Top {} in last {} min", TOP_N_LAST_MINUTES, LAST_N_MINUTES),
-        "---------------------".to_owned(),
-        last_10min_top_10.join("\n"),
-    ];
-    display.join("\n")
+    let mut lines = vec![format!("Last {}", LAST_N), "------".to_string()];
+    lines.append(&mut last_five);
+    lines.push("".to_string());
+    lines.push(format!("Top {}", TOP_N));
+    lines.push("------".to_string());
+    lines.append(&mut top_10);
+    lines.push("".to_string());
+    lines.push(format!(
+        "Top {} in last {} min",
+        TOP_N_LAST_MINUTES, LAST_N_MINUTES
+    ));
+    lines.push("---------------------".to_string());
+    lines.append(&mut last_10min_top_10);
+    cowsay.say_random_cow(lines)
 }
 
 async fn sync_database(db: Database, pool: &SqlitePool) {
-    let mut last_sync_time = None;
+    // Set to current time so values read from database are not duplicated.
+    let mut last_sync_time = Some(SystemTime::now());
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(SYNC_TIME_MINUTES * 60)).await;
 
@@ -138,9 +141,14 @@ async fn load_database(db: &Database, pool: &SqlitePool) {
     let last_n_minutes = format!("-{LAST_N_MINUTES} minute");
     let mut hits_last_n_minutes = sqlx::query!(r#"SELECT ip, timestamp FROM hits WHERE timestamp >= DATETIME('NOW', ?) ORDER BY timestamp ASC"#, last_n_minutes)
         .fetch(pool);
-    while let Some(hit) = hits_last_n_minutes.try_next().await.expect("Failed to read next row") {
+    while let Some(hit) = hits_last_n_minutes
+        .try_next()
+        .await
+        .expect("Failed to read next row")
+    {
         let ip = hit.ip;
-        let timestamp = SystemTime::from(Local.from_local_datetime(&hit.timestamp.unwrap()).unwrap());
+        let timestamp =
+            SystemTime::from(Local.from_local_datetime(&hit.timestamp.unwrap()).unwrap());
         db.insert_timestamp(ip.clone(), timestamp);
         if db.get_all_time_hits(&ip) == 0 {
             let ip_all_time_hits = sqlx::query!(
@@ -182,23 +190,14 @@ async fn main() {
     load_database(&db, &pool).await;
     println!("Done loading database");
 
-    // Increase size of database for testing
-    //let num_fake_ips = 1000;
-    //let distr = rand::distributions::Uniform::<u32>::new(0, 50);
-    //let mut rng = rand::thread_rng();
-    //for n in 1..num_fake_ips {
-    //let num_hits = rng.sample(distr);
-    //for _ in 0..(num_hits + 1) {
-    //db.new_hit(n.to_string());
-    //}
-    //}
-    //println!("Done generating fake database");
+    let mut cowsay = cowsay::Cowsay::new();
+    cowsay.load_cows("cows");
 
     let sync_db = db.clone();
     tokio::spawn(async move {
         sync_database(sync_db, &pool).await;
     });
 
-    let routes = warp::header("X-Real-IP").map(move |ip| handle_request(ip, db.clone()));
+    let routes = warp::header("X-Real-IP").map(move |ip| handle_request(ip, db.clone(), &cowsay));
     warp::serve(routes).run(([127, 0, 0, 1], SERVER_PORT)).await;
 }
